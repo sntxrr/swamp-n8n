@@ -389,6 +389,105 @@ Deno.test("instance schema records that n8n disclosed no version", () => {
   assertEquals((parsed as { versionDisclosed: boolean }).versionDisclosed, false);
 });
 
+/* ------------------------------------------------------------------ *
+ * sync — versionDisclosed is derived, not asserted
+ * ------------------------------------------------------------------ */
+
+/** Minimal stand-in for the swamp method context, capturing the write. */
+function captureContext(written: Record<string, unknown>[]) {
+  return {
+    globalArgs: {
+      baseUrl: "http://n8n.test:5678",
+      npmPackage: "n8n",
+      channel: "stable",
+      githubRepo: "n8n-io/n8n",
+      imageRepository: "docker.n8n.io/n8nio/n8n",
+      verifyRegistry: "registry-1.docker.io",
+      verifyRepository: "n8nio/n8n",
+      timeoutMs: 5000,
+    },
+    logger: { info: () => {}, warn: () => {} },
+    writeResource: (spec: string, _name: string, data: Record<string, unknown>) => {
+      // Parse through the declared schema, so a write that does not conform
+      // fails the test rather than the operator.
+      (model.resources as Record<string, { schema: { parse: (d: unknown) => unknown } }>)[spec]
+        .schema.parse(data);
+      written.push(data);
+      return Promise.resolve({ name: _name });
+    },
+  };
+}
+
+/** Serve /healthz and a /rest/settings payload of the caller's choosing. */
+function settingsResponder(settings: Record<string, unknown>) {
+  return (url: string) => {
+    if (url.endsWith("/healthz")) {
+      return new Response('{"status":"ok"}', { status: 200 });
+    }
+    if (url.endsWith("/rest/settings")) {
+      return new Response(JSON.stringify({ data: settings }), { status: 200 });
+    }
+    return new Response(null, { status: 404 });
+  };
+}
+
+Deno.test("sync reports versionDisclosed false for n8n's real public payload", async () => {
+  // The exact key set measured against n8n 2.25.7 on 2026-09-05.
+  const written: Record<string, unknown>[] = [];
+  await withFetch(
+    settingsResponder({
+      settingsMode: "public",
+      userManagement: { authenticationMethod: "email" },
+      sso: { saml: { loginEnabled: false }, ldap: { loginEnabled: false } },
+      enterprise: {},
+      communityNodesEnabled: true,
+    }),
+    async () => {
+      // deno-lint-ignore no-explicit-any
+      await (model.methods.sync.execute as any)({}, captureContext(written));
+    },
+  );
+  assertEquals(written.length, 1);
+  assertEquals(written[0].versionDisclosed, false);
+  assertEquals(written[0].settingsMode, "public");
+  assertEquals(written[0].authenticationMethod, "email");
+  assertEquals(written[0].ssoEnabled, false);
+});
+
+Deno.test("sync reports versionDisclosed true if n8n ever starts disclosing one", async () => {
+  // The whole reason this field is derived rather than hardcoded false. If a
+  // release starts answering with a version, this must notice -- otherwise the
+  // data keeps insisting `drift` needs its argument long after it stopped
+  // being true.
+  const written: Record<string, unknown>[] = [];
+  await withFetch(
+    settingsResponder({ settingsMode: "public", versionCli: "2.37.10" }),
+    async () => {
+      // deno-lint-ignore no-explicit-any
+      await (model.methods.sync.execute as any)({}, captureContext(written));
+    },
+  );
+  assertEquals(written[0].versionDisclosed, true);
+});
+
+Deno.test("sync records a down instance as a health result, not an error", async () => {
+  // A refused connection must not throw: a down instance and a broken check
+  // have to stay distinguishable.
+  const written: Record<string, unknown>[] = [];
+  await withFetch(
+    () => {
+      throw new TypeError("connection refused");
+    },
+    async () => {
+      // deno-lint-ignore no-explicit-any
+      await (model.methods.sync.execute as any)({}, captureContext(written));
+    },
+  );
+  assertEquals(written[0].healthy, false);
+  assertEquals(written[0].status, 0);
+  assertEquals(written[0].versionDisclosed, false);
+});
+
 Deno.test("drift schema accepts a full behind result", () => {
   const parsed = model.resources.drift.schema.parse({
     runningVersion: "2.25.7",

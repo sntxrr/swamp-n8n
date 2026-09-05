@@ -117,7 +117,7 @@ swamp data get drift-current --json | jq '{status, latestVersion, releasesBehind
 
 | Resource | Lifetime | Description |
 | --- | --- | --- |
-| `instance` | infinite | Liveness and the pre-login auth surface. Records `versionDisclosed: false` — the reason `drift` needs an argument, in the data rather than only in the docs. |
+| `instance` | infinite | Liveness and the pre-login auth surface. Records `versionDisclosed`, read from the payload rather than hardcoded — it is the reason `drift` needs an argument, and if a future n8n starts disclosing a version it turns true on its own. |
 | `drift` | infinite | `status` (`current`/`behind`/`ahead`), `behind`, `releasesBehind`, `missedReleases`, `nextChannelVersion`, `imageAvailable`, `image`. |
 
 Alert on `behind`.

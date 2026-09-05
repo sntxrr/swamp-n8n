@@ -146,10 +146,11 @@ const InstanceSchema = z.object({
       "payload, which is all an unauthenticated caller ever sees.",
   ),
   versionDisclosed: z.boolean().describe(
-    "Whether the instance told us its version. Always false against a public " +
-      "settings payload -- recorded rather than assumed so that `drift` " +
-      "needing an explicit runningVersion is visible in the data, not just " +
-      "in the docs.",
+    "Whether the instance told us its version. Read from the payload rather " +
+      "than hardcoded, so it is evidence rather than an assertion: it is " +
+      "false for every n8n measured so far, and the day a release starts " +
+      "disclosing a version unauthenticated this turns true on its own and " +
+      "`drift` no longer needs its runningVersion argument.",
   ),
   authenticationMethod: z.string().nullable().describe(
     "How users log in, e.g. `email`. Null when not disclosed.",
@@ -670,6 +671,14 @@ export const model = {
         let settingsMode: string | null = null;
         let authenticationMethod: string | null = null;
         let ssoEnabled: boolean | null = null;
+        // DERIVED, deliberately not hardcoded. It is false for every n8n
+        // measured so far, and writing `false` directly would be simpler and a
+        // lie waiting to happen: if n8n ever discloses a version to
+        // unauthenticated callers, a constant would keep reporting that it does
+        // not, and `drift` would go on requiring its argument for a reason that
+        // had stopped being true. Read from the payload, the day that changes
+        // the data says so.
+        let versionDisclosed = false;
         if (healthy) {
           try {
             const res = await fetch(`${base}/rest/settings`, {
@@ -697,6 +706,12 @@ export const model = {
                 ssoEnabled = Boolean(sso.saml?.loginEnabled) ||
                   Boolean(sso.ldap?.loginEnabled);
               }
+              // Both spellings: `versionCli` is what n8n calls it in the
+              // authenticated payload, `version` is the shape a reverse proxy
+              // or a future release might use. Either one means `drift` could
+              // stop needing its argument.
+              versionDisclosed = typeof data.versionCli === "string" ||
+                typeof data.version === "string";
             } else {
               await res.body?.cancel();
             }
@@ -729,7 +744,7 @@ export const model = {
             settingsMode,
             // Recorded as data, not merely documented: `drift` requires an
             // explicit runningVersion, and this is the field that explains why.
-            versionDisclosed: false,
+            versionDisclosed,
             authenticationMethod,
             ssoEnabled,
             detail,
