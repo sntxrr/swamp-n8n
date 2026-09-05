@@ -1,0 +1,16 @@
+swampVersion: 20260904.182624.0
+initializedAt: "2026-09-05T19:36:17.912Z"
+repoId: 717ea8c6-47ca-41c3-8993-65c7d1fa62e4
+tools:
+  - claude
+gitignoreManaged: true
+
+# The datastore block is deliberately absent. It names an S3 bucket, and a
+# bucket name is the one piece of this file worth not publishing -- the bucket
+# is locked down, so the name is an information disclosure rather than an
+# access hole, but it still makes a target easier to find. Same reasoning as
+# swamp-openwebui and swamp-homelab, which track only their .example copy for
+# exactly this reason.
+#
+# The real .swamp.yaml is gitignored. This repo is extension source only; the
+# implementation that needs a datastore lives in ~/git/swamp-homelab.

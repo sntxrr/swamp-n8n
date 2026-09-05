@@ -1,0 +1,22 @@
+manifestVersion: 1
+
+name: "@sntxrr/n8n"
+version: "2026.09.05.1"
+description: "Read a running n8n deployment and report how far its pinned version has drifted behind the channel n8n itself calls stable. Both methods are strictly read-only — this extension never upgrades n8n, edits a workflow, touches a credential, or restarts a container; it tells you an update exists and stops there. `drift` takes the running version as an argument rather than reading it, because n8n does not disclose one: its `/rest/settings` answers 200 unauthenticated but with `settingsMode: public`, a reduced payload carrying no version field at all, and `versionCli` reaches authenticated callers only — so the version comes from the pinned image tag on the host, which is what the deployment actually is rather than what a process predating the current pin believes itself to be. The upgrade target is npm's dist-tag, never the newest published release: n8n ships its in-progress minor into the same GitHub release namespace flagged `prerelease: true` and promotes that line later, so on 2026-09-05 the newest release was 2.38.3 while stable was 2.37.10, and the 2.37 line had itself been prerelease through 2.37.6. GitHub releases are still read, but only to enumerate the stable releases that were missed and to link the notes, since the `prerelease` flag is the historical record of which line was stable when and dist-tags do not retain it. Image existence is verified against `registry-1.docker.io` rather than the `docker.n8n.io` mirror the pin names: that mirror 404s its own token endpoint, delegates auth to Docker Hub, and then answers 429 to every manifest request for tags that exist and tags that do not alike, so it cannot return a usable answer — and a 429 is raised as indeterminate rather than folded into `absent`, which would suppress every update forever while the check looked healthy. An exhausted GitHub rate limit, an unreachable registry, and an unparseable running version are all raised as errors rather than reported as a reassuring `current`."
+repository: "https://github.com/sntxrr/swamp-n8n"
+
+models:
+  - n8n_instance.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.md
+
+labels:
+  - n8n
+  - automation
+  - workflow
+  - drift
+  - version
+  - homelab
+  - self-hosted
