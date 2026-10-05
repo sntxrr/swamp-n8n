@@ -1,14 +1,20 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
+  auditErrorWorkflows,
   compareVersions,
   computeDrift,
+  type HandlerState,
   imageTagExists,
+  listActiveWorkflows,
   model,
   normaliseTag,
   parseAuthChallenge,
   parseVersion,
   readDistTags,
+  readHandlerState,
   type ReleaseInfo,
+  summariseFindings,
+  type WorkflowSummary,
 } from "./n8n_instance.ts";
 
 /* ------------------------------------------------------------------ *
@@ -105,10 +111,13 @@ Deno.test("parseAuthChallenge reads the realm a mirror delegates to", () => {
 });
 
 Deno.test("parseAuthChallenge tolerates a missing service", () => {
-  assertEquals(parseAuthChallenge('Bearer realm="https://example.test/token"'), {
-    realm: "https://example.test/token",
-    service: null,
-  });
+  assertEquals(
+    parseAuthChallenge('Bearer realm="https://example.test/token"'),
+    {
+      realm: "https://example.test/token",
+      service: null,
+    },
+  );
 });
 
 Deno.test("parseAuthChallenge rejects non-Bearer and realm-less challenges", () => {
@@ -315,7 +324,12 @@ Deno.test("imageTagExists follows the challenge to the delegated realm", async (
     return new Response(null, { status: 200 });
   }, async () => {
     assertEquals(
-      await imageTagExists("registry-1.docker.io", "n8nio/n8n", "2.37.10", 5000),
+      await imageTagExists(
+        "registry-1.docker.io",
+        "n8nio/n8n",
+        "2.37.10",
+        5000,
+      ),
       true,
     );
     // The token was fetched from the realm the challenge named, not from
@@ -324,7 +338,10 @@ Deno.test("imageTagExists follows the challenge to the delegated realm", async (
       seen.some((u) => u.startsWith("https://auth.docker.io/token")),
       true,
     );
-    assertEquals(seen.some((u) => u.includes("registry-1.docker.io/token")), false);
+    assertEquals(
+      seen.some((u) => u.includes("registry-1.docker.io/token")),
+      false,
+    );
   });
 });
 
@@ -333,7 +350,12 @@ Deno.test("imageTagExists reports a 404 tag as absent", async () => {
     () => new Response(null, { status: 404 }),
     async () => {
       assertEquals(
-        await imageTagExists("registry-1.docker.io", "n8nio/n8n", "9.9.9", 5000),
+        await imageTagExists(
+          "registry-1.docker.io",
+          "n8nio/n8n",
+          "9.9.9",
+          5000,
+        ),
         false,
       );
     },
@@ -367,8 +389,16 @@ Deno.test("imageTagExists throws on 429 instead of calling the tag absent", asyn
 
 Deno.test("model declares both resources and both methods", () => {
   assertEquals(model.type, "@sntxrr/n8n/instance");
-  assertEquals(Object.keys(model.resources).sort(), ["drift", "instance"]);
-  assertEquals(Object.keys(model.methods).sort(), ["drift", "sync"]);
+  assertEquals(Object.keys(model.resources).sort(), [
+    "drift",
+    "errorWorkflowAudit",
+    "instance",
+  ]);
+  assertEquals(Object.keys(model.methods).sort(), [
+    "audit_error_workflows",
+    "drift",
+    "sync",
+  ]);
 });
 
 Deno.test("instance schema records that n8n disclosed no version", () => {
@@ -386,7 +416,10 @@ Deno.test("instance schema records that n8n disclosed no version", () => {
     detail: '{"status":"ok"}',
     checkedAt: new Date().toISOString(),
   });
-  assertEquals((parsed as { versionDisclosed: boolean }).versionDisclosed, false);
+  assertEquals(
+    (parsed as { versionDisclosed: boolean }).versionDisclosed,
+    false,
+  );
 });
 
 /* ------------------------------------------------------------------ *
@@ -407,10 +440,17 @@ function captureContext(written: Record<string, unknown>[]) {
       timeoutMs: 5000,
     },
     logger: { info: () => {}, warn: () => {} },
-    writeResource: (spec: string, _name: string, data: Record<string, unknown>) => {
+    writeResource: (
+      spec: string,
+      _name: string,
+      data: Record<string, unknown>,
+    ) => {
       // Parse through the declared schema, so a write that does not conform
       // fails the test rather than the operator.
-      (model.resources as Record<string, { schema: { parse: (d: unknown) => unknown } }>)[spec]
+      (model.resources as Record<
+        string,
+        { schema: { parse: (d: unknown) => unknown } }
+      >)[spec]
         .schema.parse(data);
       written.push(data);
       return Promise.resolve({ name: _name });
@@ -505,4 +545,262 @@ Deno.test("drift schema accepts a full behind result", () => {
     checkedAt: new Date().toISOString(),
   });
   assertEquals((parsed as { behind: boolean }).behind, true);
+});
+
+/* ------------------------------------------------------------------ *
+ * audit_error_workflows
+ * ------------------------------------------------------------------ */
+
+const HANDLER = "handlerWf0000001";
+const USABLE: HandlerState = { found: true, active: true, archived: false };
+
+function wf(
+  id: string,
+  errorWorkflow: string | null,
+  extra: Partial<WorkflowSummary> = {},
+): WorkflowSummary {
+  return {
+    id,
+    name: `wf ${id}`,
+    active: true,
+    isArchived: false,
+    errorWorkflow,
+    ...extra,
+  };
+}
+
+Deno.test("auditErrorWorkflows passes a workflow that names a usable handler", () => {
+  // The positive control: the handler plus one correctly attached workflow.
+  assertEquals(
+    auditErrorWorkflows(
+      [wf(HANDLER, null), wf("bridge", HANDLER)],
+      HANDLER,
+      USABLE,
+    ),
+    [],
+  );
+});
+
+Deno.test("auditErrorWorkflows exempts the handler itself", () => {
+  // The handler has no errorWorkflow of its own and must not be flagged.
+  assertEquals(auditErrorWorkflows([wf(HANDLER, null)], HANDLER, USABLE), []);
+});
+
+Deno.test("auditErrorWorkflows flags missing and wrong handlers", () => {
+  const findings = auditErrorWorkflows(
+    [wf("b", "someOtherWf"), wf("a", null), wf("c", HANDLER)],
+    HANDLER,
+    USABLE,
+  );
+  assertEquals(findings, [
+    { id: "a", name: "wf a", reason: "missing", errorWorkflow: null },
+    {
+      id: "b",
+      name: "wf b",
+      reason: "wrong-handler",
+      errorWorkflow: "someOtherWf",
+    },
+  ]);
+});
+
+Deno.test("auditErrorWorkflows ignores inactive and archived workflows", () => {
+  assertEquals(
+    auditErrorWorkflows(
+      [
+        wf("off", null, { active: false }),
+        wf("gone", null, { isArchived: true }),
+      ],
+      HANDLER,
+      USABLE,
+    ),
+    [],
+  );
+});
+
+Deno.test("auditErrorWorkflows flags every workflow when the handler is unusable", () => {
+  // An archived or deactivated handler silently uncovers everything that
+  // names it, so each one is listed rather than one easily-missed flag.
+  for (
+    const state of [
+      { found: true, active: false, archived: false },
+      { found: true, active: false, archived: true },
+      { found: false, active: false, archived: false },
+    ]
+  ) {
+    const findings = auditErrorWorkflows([wf("x", HANDLER)], HANDLER, state);
+    assertEquals(findings.map((f) => f.reason), ["handler-unusable"]);
+  }
+});
+
+Deno.test("summariseFindings writes one line per finding", () => {
+  assertEquals(
+    summariseFindings([
+      { id: "a", name: "Alpha", reason: "missing", errorWorkflow: null },
+      { id: "b", name: "Beta", reason: "wrong-handler", errorWorkflow: "z" },
+    ]),
+    'a "Alpha": missing\nb "Beta": wrong-handler',
+  );
+  assertEquals(summariseFindings([]), "");
+});
+
+Deno.test("listActiveWorkflows follows nextCursor and sends the key", async () => {
+  const seen: { url: string; key: string | null }[] = [];
+  await withFetch((url, init) => {
+    const key = new Headers(init?.headers).get("X-N8N-API-KEY");
+    seen.push({ url, key });
+    const cursor = new URL(url).searchParams.get("cursor");
+    const body = cursor === null
+      ? {
+        data: [{ id: "a", name: "A", active: true, settings: {} }],
+        nextCursor: "p2",
+      }
+      : {
+        data: [{
+          id: "b",
+          name: "B",
+          active: true,
+          settings: { errorWorkflow: HANDLER },
+        }],
+        nextCursor: null,
+      };
+    return new Response(JSON.stringify(body), { status: 200 });
+  }, async () => {
+    const list = await listActiveWorkflows(
+      "http://n8n.test:5678",
+      "k",
+      1,
+      5000,
+    );
+    assertEquals(list.map((w) => [w.id, w.errorWorkflow]), [["a", null], [
+      "b",
+      HANDLER,
+    ]]);
+  });
+  assertEquals(seen.length, 2);
+  assertEquals(seen.every((s) => s.key === "k"), true);
+  assertEquals(new URL(seen[0].url).searchParams.get("active"), "true");
+});
+
+Deno.test("listActiveWorkflows throws on 401 instead of reporting a clean audit", async () => {
+  await withFetch(
+    () => new Response('{"message":"unauthorized"}', { status: 401 }),
+    async () => {
+      let threw = false;
+      try {
+        await listActiveWorkflows("http://n8n.test:5678", "bad", 100, 5000);
+      } catch (err) {
+        threw = true;
+        assertEquals((err as Error).message.includes("401"), true);
+      }
+      assertEquals(threw, true);
+    },
+  );
+});
+
+Deno.test("listActiveWorkflows refuses a cursor that never ends", async () => {
+  await withFetch(
+    () =>
+      new Response(JSON.stringify({ data: [], nextCursor: "again" }), {
+        status: 200,
+      }),
+    async () => {
+      let threw = false;
+      try {
+        await listActiveWorkflows(
+          "http://n8n.test:5678",
+          "k",
+          100,
+          5000,
+          undefined,
+          3,
+        );
+      } catch (err) {
+        threw = true;
+        assertEquals((err as Error).message.includes("partial"), true);
+      }
+      assertEquals(threw, true);
+    },
+  );
+});
+
+Deno.test("readHandlerState treats a 404 as a missing handler, not an error", async () => {
+  await withFetch(
+    () => new Response(null, { status: 404 }),
+    async () => {
+      assertEquals(
+        await readHandlerState("http://n8n.test:5678", "k", HANDLER, 5000),
+        { found: false, active: false, archived: false },
+      );
+    },
+  );
+});
+
+/** Serve the handler and a workflow list for the method-level tests. */
+function apiResponder(list: Record<string, unknown>[]) {
+  return (url: string) => {
+    const path = new URL(url).pathname;
+    if (path === `/api/v1/workflows/${HANDLER}`) {
+      return new Response(
+        JSON.stringify({
+          id: HANDLER,
+          name: "handler",
+          active: true,
+          isArchived: false,
+        }),
+        { status: 200 },
+      );
+    }
+    if (path === "/api/v1/workflows") {
+      return new Response(JSON.stringify({ data: list, nextCursor: null }), {
+        status: 200,
+      });
+    }
+    return new Response(null, { status: 404 });
+  };
+}
+
+Deno.test("audit_error_workflows writes a schema-valid finding", async () => {
+  const written: Record<string, unknown>[] = [];
+  const ctx = captureContext(written);
+  (ctx.globalArgs as Record<string, unknown>).apiKey = "k";
+  await withFetch(
+    apiResponder([
+      { id: HANDLER, name: "handler", active: true, settings: {} },
+      {
+        id: "bridge",
+        name: "Bridge",
+        active: true,
+        settings: { errorWorkflow: HANDLER },
+      },
+      { id: "throwaway", name: "Throwaway", active: true, settings: {} },
+    ]),
+    async () => {
+      // deno-lint-ignore no-explicit-any
+      await (model.methods.audit_error_workflows.execute as any)(
+        { handlerWorkflowId: HANDLER, pageSize: 100 },
+        ctx,
+      );
+    },
+  );
+  assertEquals(written.length, 1);
+  assertEquals(written[0].hasFindings, true);
+  assertEquals(written[0].workflowsChecked, 2);
+  assertEquals(written[0].summary, 'throwaway "Throwaway": missing');
+});
+
+Deno.test("audit_error_workflows throws without an apiKey", async () => {
+  const written: Record<string, unknown>[] = [];
+  let threw = false;
+  try {
+    // deno-lint-ignore no-explicit-any
+    await (model.methods.audit_error_workflows.execute as any)(
+      { handlerWorkflowId: HANDLER, pageSize: 100 },
+      captureContext(written),
+    );
+  } catch (err) {
+    threw = true;
+    assertEquals((err as Error).message.includes("apiKey"), true);
+  }
+  assertEquals(threw, true);
+  assertEquals(written.length, 0);
 });

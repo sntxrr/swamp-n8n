@@ -1,9 +1,10 @@
 # @sntxrr/n8n
 
 Read a running [n8n](https://n8n.io) deployment and report how far its pinned
-version has drifted behind the channel n8n itself calls stable.
+version has drifted behind the channel n8n itself calls stable, and which
+active workflows would fail silently because no error workflow is attached.
 
-One model type, `@sntxrr/n8n/instance`, with two methods. **Both are read-only**
+One model type, `@sntxrr/n8n/instance`, with three methods. **All are read-only**
 — nothing here upgrades n8n, edits a workflow, touches a credential, or
 restarts a container. It tells you an update exists; applying it is yours to do.
 
@@ -11,7 +12,31 @@ restarts a container. It tells you an update exists; applying it is yours to do.
 
 Stated plainly, because the name invites the assumption: it does not upgrade
 the instance, run migrations, manage workflows or credentials, or touch the
-container. It reads a version number and compares it to another one.
+container. It reads a version number and compares it to another one, and it
+reads workflow settings and reports which ones lack an error workflow. It never
+attaches one.
+
+## Why `audit_error_workflows` needs an API key
+
+n8n has no instance-wide default error workflow. Each workflow names its own in
+`settings.errorWorkflow`, so a workflow activated without one fails and nobody
+hears about it. Fixing today's workflows does not cover tomorrow's.
+
+Only the authenticated public API discloses that setting, so this method takes
+an optional `apiKey` global argument. `sync` and `drift` never send it. On
+editions without scoped API keys the key carries its owner's full rights, even
+though this method only reads. Store it in a vault and treat it accordingly.
+
+A workflow is flagged when it is active, not archived, not the handler itself,
+and its `errorWorkflow` is:
+
+- `missing` — unset;
+- `wrong-handler` — set to something other than `handlerWorkflowId`;
+- `handler-unusable` — set to the handler, but the handler is inactive,
+  archived or gone. Every workflow naming it is listed, not one flag.
+
+A 401/403, a malformed list, or a cursor that never ends is raised as an error.
+An audit that could not look never reports "no findings".
 
 ## Why `drift` makes you pass the running version in
 
@@ -99,8 +124,10 @@ swamp model create @sntxrr/n8n/instance n8n \
   --global-arg baseUrl=http://192.0.2.10:5678
 ```
 
-`baseUrl` is used only by `sync`. `drift` needs no access to the instance at
-all, so a check can run while n8n is down.
+`baseUrl` is used by `sync` and `audit_error_workflows`. `drift` needs no
+access to the instance at all, so a check can run while n8n is down. For the
+audit, set `apiKey` from a vault expression in the model definition rather than
+on the command line.
 
 ## Run it
 
@@ -111,6 +138,9 @@ swamp model @sntxrr/n8n/instance method run drift n8n \
   --arg runningVersion=2.25.7
 
 swamp data get drift-current --json | jq '{status, latestVersion, releasesBehind}'
+
+swamp model @sntxrr/n8n/instance method run audit_error_workflows n8n \
+  --arg handlerWorkflowId=<your error workflow id>
 ```
 
 ## Resources
@@ -119,8 +149,9 @@ swamp data get drift-current --json | jq '{status, latestVersion, releasesBehind
 | --- | --- | --- |
 | `instance` | infinite | Liveness and the pre-login auth surface. Records `versionDisclosed`, read from the payload rather than hardcoded — it is the reason `drift` needs an argument, and if a future n8n starts disclosing a version it turns true on its own. |
 | `drift` | infinite | `status` (`current`/`behind`/`ahead`), `behind`, `releasesBehind`, `missedReleases`, `nextChannelVersion`, `imageAvailable`, `image`. |
+| `errorWorkflowAudit` | infinite | `hasFindings`, `findingCount`, `findings[]` (`id`, `name`, `reason`, `errorWorkflow`), `summary` (one line per finding), handler state, `workflowsChecked`. |
 
-Alert on `behind`.
+Alert on `behind`, and separately on `hasFindings`.
 
 ## Failure is never folded into "up to date"
 

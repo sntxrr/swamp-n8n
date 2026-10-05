@@ -2,13 +2,27 @@
  * n8n instance — read a running {@link https://n8n.io | n8n} deployment and
  * report how far its pinned version has drifted behind upstream.
  *
- * Two read-only methods. `sync` records what the instance discloses about
+ * Three read-only methods. `sync` records what the instance discloses about
  * itself before login — liveness and the auth surface. `drift` compares a
  * supplied running version against the channel n8n itself calls stable and
- * reports how far behind it is.
+ * reports how far behind it is. `audit_error_workflows` lists the active
+ * workflows and flags any that would fail silently because no usable error
+ * workflow is attached.
  *
  * Nothing here writes to n8n, edits a workflow, touches a credential, or
  * restarts a container. It tells you an update exists and stops.
+ *
+ * ## Why the audit needs an API key when `drift` does not
+ *
+ * n8n has no instance-wide default error workflow. Each workflow names its own
+ * in `settings.errorWorkflow`, so one activated without it fails without
+ * telling anyone, and the only way to see that setting is the authenticated
+ * public API. The key is optional and used by `audit_error_workflows` alone;
+ * `sync` and `drift` never send it.
+ *
+ * The audit reports and never repairs. Attaching a handler is a write to a
+ * production workflow, and a watcher that also writes has to be trusted with
+ * production on every scheduled run.
  *
  * ## Why `drift` takes the running version as an argument
  *
@@ -130,6 +144,13 @@ const GlobalArgsSchema = z.object({
     "Abort each HTTP call after this long. A drift check must never hang a " +
       "workflow.",
   ),
+  // `.meta({ sensitive: true })` on the declaration line, for the same reason
+  // as githubToken above.
+  apiKey: z.string().meta({ sensitive: true }).optional().describe(
+    "n8n public API key, sent as X-N8N-API-KEY. Used ONLY by " +
+      "`audit_error_workflows`, which reads workflow settings; `sync` and " +
+      "`drift` never send it. Supply it from a vault.",
+  ),
 });
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -215,6 +236,42 @@ const DriftSchema = z.object({
       "the dist-tag, not from this list.",
   ),
   checkedAt: z.iso.datetime().describe("When the check ran."),
+});
+
+const ErrorWorkflowFindingSchema = z.object({
+  id: z.string().describe("Workflow id."),
+  name: z.string().describe("Workflow name."),
+  reason: z.enum(["missing", "wrong-handler", "handler-unusable"]).describe(
+    "`missing`: no settings.errorWorkflow at all. `wrong-handler`: it names a " +
+      "workflow other than the expected handler. `handler-unusable`: it names " +
+      "the handler, but the handler is inactive, archived or gone.",
+  ),
+  errorWorkflow: z.string().nullable().describe(
+    "What settings.errorWorkflow actually holds, null when unset.",
+  ),
+});
+
+const ErrorWorkflowAuditSchema = z.object({
+  url: z.string().describe("Base URL the audit read from."),
+  handlerWorkflowId: z.string().describe(
+    "The error workflow every active workflow is expected to name.",
+  ),
+  handlerFound: z.boolean().describe("Whether the handler workflow exists."),
+  handlerActive: z.boolean().describe("Whether the handler is active."),
+  handlerArchived: z.boolean().describe("Whether the handler is archived."),
+  workflowsChecked: z.number().int().describe(
+    "Active, non-archived workflows examined, the handler excluded.",
+  ),
+  hasFindings: z.boolean().describe("The single field to alert on."),
+  findingCount: z.number().int().describe("Number of entries in `findings`."),
+  findings: z.array(ErrorWorkflowFindingSchema).describe(
+    "Each workflow that would fail silently, in id order.",
+  ),
+  summary: z.string().describe(
+    'One line per finding, `<id> "<name>": <reason>`, ready for a ' +
+      "notification body. Empty when there are no findings.",
+  ),
+  checkedAt: z.iso.datetime().describe("When the audit ran."),
 });
 
 type Logger = {
@@ -601,6 +658,188 @@ export function computeDrift(
 }
 
 /* ------------------------------------------------------------------ *
+ * Error-workflow audit
+ * ------------------------------------------------------------------ */
+
+/** A workflow as the public API returns it, reduced to what the audit reads. */
+export type WorkflowSummary = {
+  id: string;
+  name: string;
+  active: boolean;
+  isArchived: boolean;
+  errorWorkflow: string | null;
+};
+
+/** The handler's own state, which decides whether naming it is enough. */
+export type HandlerState = {
+  found: boolean;
+  active: boolean;
+  archived: boolean;
+};
+
+export type ErrorWorkflowFinding = {
+  id: string;
+  name: string;
+  reason: "missing" | "wrong-handler" | "handler-unusable";
+  errorWorkflow: string | null;
+};
+
+/**
+ * Flag every active, non-archived workflow that would fail silently.
+ *
+ * The handler itself is exempt: it is what errors are sent TO, and pointing it
+ * at itself would loop.
+ *
+ * `handler-unusable` exists so a broken handler is reported per workflow
+ * rather than as one easily-missed flag: if the handler is archived, every
+ * workflow that names it is silently uncovered, and the alert should list them.
+ *
+ * Pure, so the rules are tested without a server.
+ */
+export function auditErrorWorkflows(
+  workflows: WorkflowSummary[],
+  handlerWorkflowId: string,
+  handler: HandlerState,
+): ErrorWorkflowFinding[] {
+  const handlerUsable = handler.found && handler.active && !handler.archived;
+  const findings: ErrorWorkflowFinding[] = [];
+  for (const wf of workflows) {
+    if (!wf.active || wf.isArchived) continue;
+    if (wf.id === handlerWorkflowId) continue;
+    let reason: ErrorWorkflowFinding["reason"] | null = null;
+    if (!wf.errorWorkflow) reason = "missing";
+    else if (wf.errorWorkflow !== handlerWorkflowId) reason = "wrong-handler";
+    else if (!handlerUsable) reason = "handler-unusable";
+    if (reason) {
+      findings.push({
+        id: wf.id,
+        name: wf.name,
+        reason,
+        errorWorkflow: wf.errorWorkflow || null,
+      });
+    }
+  }
+  return findings.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+/** One line per finding, for a notification body. */
+export function summariseFindings(findings: ErrorWorkflowFinding[]): string {
+  return findings
+    .map((f) => `${f.id} ${JSON.stringify(f.name)}: ${f.reason}`)
+    .join("\n");
+}
+
+type RawWorkflow = {
+  id?: unknown;
+  name?: unknown;
+  active?: unknown;
+  isArchived?: unknown;
+  settings?: { errorWorkflow?: unknown } | null;
+};
+
+function toSummary(raw: RawWorkflow): WorkflowSummary | null {
+  if (typeof raw.id !== "string") return null;
+  const ew = raw.settings?.errorWorkflow;
+  return {
+    id: raw.id,
+    name: typeof raw.name === "string" ? raw.name : "",
+    active: raw.active === true,
+    isArchived: raw.isArchived === true,
+    errorWorkflow: typeof ew === "string" && ew !== "" ? ew : null,
+  };
+}
+
+/** Throw a message that names the auth problem rather than a bare status. */
+async function publicApiError(res: Response, what: string): Promise<Error> {
+  const hint = res.status === 401 || res.status === 403
+    ? " (the API key is missing, revoked or lacks workflow:list/workflow:read)"
+    : "";
+  return new Error(
+    `n8n public API returned HTTP ${res.status} for ${what}${hint}: ` +
+      `${await readErrorBody(res)}`,
+  );
+}
+
+/**
+ * Every active workflow, following `nextCursor` to the end.
+ *
+ * A page cap guards against a cursor that never terminates; hitting it throws
+ * rather than auditing a partial list, because a workflow on an unread page
+ * is exactly the one nobody would hear about.
+ */
+export async function listActiveWorkflows(
+  baseUrl: string,
+  apiKey: string,
+  pageSize: number,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  maxPages = 50,
+): Promise<WorkflowSummary[]> {
+  const out: WorkflowSummary[] = [];
+  let cursor: string | null = null;
+  for (let page = 0; page < maxPages; page++) {
+    const url = new URL(`${baseUrl}/api/v1/workflows`);
+    url.searchParams.set("active", "true");
+    url.searchParams.set("limit", String(pageSize));
+    url.searchParams.set("excludePinnedData", "true");
+    if (cursor) url.searchParams.set("cursor", cursor);
+    const res = await fetch(url, {
+      headers: { "X-N8N-API-KEY": apiKey, Accept: "application/json" },
+      signal: callSignal(timeoutMs, signal),
+    });
+    if (!res.ok) throw await publicApiError(res, "the workflow list");
+    const body = await res.json() as {
+      data?: RawWorkflow[];
+      nextCursor?: string | null;
+    };
+    if (!Array.isArray(body.data)) {
+      throw new Error(
+        "n8n public API returned no `data` array for the workflow list; " +
+          "refusing to report an empty, clean audit",
+      );
+    }
+    for (const raw of body.data) {
+      const s = toSummary(raw);
+      if (s) out.push(s);
+    }
+    cursor = body.nextCursor ?? null;
+    if (!cursor) return out;
+  }
+  throw new Error(
+    `n8n workflow list was still paging after ${maxPages} pages; refusing ` +
+      `to audit a partial list`,
+  );
+}
+
+/** The handler's state. A 404 is a result (`found: false`), not an error. */
+export async function readHandlerState(
+  baseUrl: string,
+  apiKey: string,
+  handlerWorkflowId: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<HandlerState> {
+  const res = await fetch(
+    `${baseUrl}/api/v1/workflows/${encodeURIComponent(handlerWorkflowId)}`,
+    {
+      headers: { "X-N8N-API-KEY": apiKey, Accept: "application/json" },
+      signal: callSignal(timeoutMs, signal),
+    },
+  );
+  if (res.status === 404) {
+    await res.body?.cancel();
+    return { found: false, active: false, archived: false };
+  }
+  if (!res.ok) throw await publicApiError(res, "the handler workflow");
+  const raw = await res.json() as RawWorkflow;
+  return {
+    found: true,
+    active: raw.active === true,
+    archived: raw.isArchived === true,
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Model
  * ------------------------------------------------------------------ */
 
@@ -620,8 +859,16 @@ export const model = {
   type: "@sntxrr/n8n/instance",
   description:
     "Read a running n8n deployment and report how far its pinned version has drifted behind the channel n8n calls stable. Strictly read-only.",
-  version: "2026.09.05.1",
+  version: "2026.10.05.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.10.05.1",
+      description:
+        "Adds optional apiKey and the audit_error_workflows method; existing arguments are unchanged, so nothing to migrate",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 
   resources: {
     instance: {
@@ -635,6 +882,13 @@ export const model = {
       description:
         "Comparison of the running version against the authoritative npm channel.",
       schema: DriftSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
+    },
+    errorWorkflowAudit: {
+      description:
+        "Active workflows that would fail silently because no usable error workflow is attached.",
+      schema: ErrorWorkflowAuditSchema,
       lifetime: "infinite" as const,
       garbageCollection: 30,
     },
@@ -947,6 +1201,90 @@ export const model = {
           truncated: drift.truncated,
           checkedAt: new Date().toISOString(),
         });
+        return { dataHandles: [handle] };
+      },
+    },
+
+    audit_error_workflows: {
+      description:
+        "List active, non-archived workflows through the public API and flag any whose settings.errorWorkflow is missing, names a workflow other than the expected handler, or names a handler that is inactive, archived or gone. Read-only: it never attaches a handler.",
+      arguments: z.object({
+        handlerWorkflowId: z.string().min(1).describe(
+          "Id of the error workflow every active workflow should name. It is " +
+            "exempt from the audit itself.",
+        ),
+        pageSize: z.number().int().min(1).max(250).default(100).describe(
+          "Workflows per page of the public API list.",
+        ),
+      }),
+      execute: async (
+        args: { handlerWorkflowId: string; pageSize: number },
+        context: Context,
+      ) => {
+        const { globalArgs, logger } = context;
+        if (!globalArgs.apiKey) {
+          // Throw rather than write an empty audit: "no findings" from a check
+          // that could not look is the failure this model exists to prevent.
+          throw new Error(
+            "audit_error_workflows needs globalArgs.apiKey (an n8n public API " +
+              "key); without it n8n will not disclose workflow settings",
+          );
+        }
+        const base = globalArgs.baseUrl.replace(/\/+$/, "");
+
+        const handler = await readHandlerState(
+          base,
+          globalArgs.apiKey,
+          args.handlerWorkflowId,
+          globalArgs.timeoutMs,
+          context.signal,
+        );
+        const workflows = await listActiveWorkflows(
+          base,
+          globalArgs.apiKey,
+          args.pageSize,
+          globalArgs.timeoutMs,
+          context.signal,
+        );
+        const findings = auditErrorWorkflows(
+          workflows,
+          args.handlerWorkflowId,
+          handler,
+        );
+        const workflowsChecked =
+          workflows.filter((w) =>
+            w.active && !w.isArchived && w.id !== args.handlerWorkflowId
+          ).length;
+
+        if (findings.length > 0) {
+          logger.warn(
+            "{n} of {checked} active n8n workflows have no usable error workflow",
+            { n: findings.length, checked: workflowsChecked },
+          );
+        } else {
+          logger.info(
+            "all {checked} active n8n workflows name a usable error workflow",
+            { checked: workflowsChecked },
+          );
+        }
+
+        const handle = await context.writeResource(
+          "errorWorkflowAudit",
+          "error-workflow-audit-current",
+          {
+            url: base,
+            handlerWorkflowId: args.handlerWorkflowId,
+            handlerFound: handler.found,
+            handlerActive: handler.active,
+            handlerArchived: handler.archived,
+            workflowsChecked,
+            hasFindings: findings.length > 0,
+            findingCount: findings.length,
+            findings,
+            summary: summariseFindings(findings),
+            checkedAt: new Date().toISOString(),
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
